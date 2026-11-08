@@ -1,6 +1,10 @@
 import time
-import GPUtil
 import sys
+
+try:
+    import GPUtil
+except ImportError:  # a venv without pip cannot install it
+    GPUtil = None
 from comfy.comfy_types import IO
 
 
