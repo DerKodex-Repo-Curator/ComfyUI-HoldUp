@@ -18,6 +18,9 @@ class HoldUp:
                 "use_waitTemperature": ("BOOLEAN", {"default": True}),
                 "waitTemperature": ("INT", {"default": 50, "min": 45, "max": 90}),
                 "waitSeconds": ("INT", {"default": 0, "min": 0, "max": 120}),
+            },
+            "optional": {
+                "policy_path": ("STRING", {"default": ""}),
             }
         }
 
@@ -71,81 +74,116 @@ class HoldUp:
         sys.stdout.write(full_line)
         sys.stdout.flush()
 
-    def execute_cool_down(self, input, use_waitTemperature, waitTemperature, waitSeconds):
-        """
-        Waits for GPU(s) to cool down and/or a fixed time delay before returning input.
+    def _policy(self, policy_path):
+        """Read the shared GPU policy, falling back to conservative defaults.
 
-        Args:
-            input: Any type of data to pass through.
-            use_waitTemperature (bool): Whether to wait for GPU temperature.
-            waitTemperature (int): Target temperature in Celsius.
-            waitSeconds (int): Additional seconds to wait.
-
-        Returns:
-            tuple: The input data unchanged.
+        The threshold is environmental, so it is not baked into a workflow: one
+        file, shared by every project, changed without restarting anything.
         """
+        import json
+        import os
+
+        path = policy_path or os.environ.get("GPU_POLICY_PATH") or "/app/server/data/gpu-policy.json"
+        defaults = {"temp_limit_c": 50, "max_wait_s": 180, "sample_interval_s": 2, "fail_closed": True}
+        try:
+            with open(path) as fh:
+                loaded = json.load(fh)
+            merged = dict(defaults)
+            merged.update({k: v for k, v in loaded.items() if k in defaults})
+            return merged, path
+        except (OSError, ValueError) as exc:
+            print("[holdup] policy unavailable (%s); using defaults" % exc, file=sys.stderr)
+            return defaults, path
+
+    def _my_gpu_index(self):
+        """The physical GPU this process will use.
+
+        The launcher pins a project with --cuda-device N, so reading the process's
+        own command line is the only reliable way to know which card is ours.
+        """
+        import os
+
+        try:
+            with open("/proc/self/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\x00")
+            argv = [a.decode("utf-8", "replace") for a in argv if a]
+            for i, arg in enumerate(argv):
+                if arg == "--cuda-device" and i + 1 < len(argv):
+                    return int(argv[i + 1])
+                if arg.startswith("--cuda-device="):
+                    return int(arg.split("=", 1)[1])
+        except (OSError, ValueError):
+            pass
+        env = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if env:
+            try:
+                return int(env.split(",")[0])
+            except ValueError:
+                pass
+        try:
+            import torch
+
+            return int(torch.cuda.current_device())
+        except Exception:
+            return None
+
+    def execute_cool_down(self, input, use_waitTemperature, waitTemperature, waitSeconds, policy_path=""):
         if use_waitTemperature:
-            initial_peak_temp_this_hot_cycle = None
-            cooling_message_printed_this_cycle = False
+            policy, path = self._policy(policy_path)
+            # The policy wins over the widget: the threshold is environmental and
+            # has to change in one place, not inside every saved workflow.
+            target = float(policy["temp_limit_c"])
+            max_wait = float(policy["max_wait_s"])
+            interval = float(policy["sample_interval_s"])
+            fail_closed = bool(policy["fail_closed"])
+            index = self._my_gpu_index()
 
+            started = time.time()
+            reported = False
             while True:
                 try:
                     gpus = GPUtil.getGPUs()
-                except Exception as e:
-                    print(f"\nError accessing GPU information: {e}. Skipping cool down.", file=sys.stderr)
-                    return (input,)
-
+                except Exception as exc:
+                    print("[holdup] cannot read GPU state (%s); skipping gate" % exc, file=sys.stderr)
+                    break
                 if not gpus:
-                    # No GPUs detected, skip cooldown
                     break
 
-                highest_current_temp = 0.0
-                any_gpu_too_hot = False
-
-                for gpu in gpus:
-                    current_gpu_temp = float(gpu.temperature)
-                    if current_gpu_temp > highest_current_temp:
-                        highest_current_temp = current_gpu_temp
-                    if current_gpu_temp > waitTemperature:
-                        any_gpu_too_hot = True
-
-                if any_gpu_too_hot:
-                    if initial_peak_temp_this_hot_cycle is None:
-                        initial_peak_temp_this_hot_cycle = highest_current_temp
-
-                    # Update peak if temperature spikes higher mid-cooldown
-                    if highest_current_temp > initial_peak_temp_this_hot_cycle:
-                        initial_peak_temp_this_hot_cycle = highest_current_temp
-
-                    if not cooling_message_printed_this_cycle:
-                        print(f"***** GPU temperature ({highest_current_temp:.1f}°C) exceeds target ({waitTemperature}°C). Initiating cool down...")
-                        cooling_message_printed_this_cycle = True
-
-                    self._display_temperature_progress(highest_current_temp, float(waitTemperature), initial_peak_temp_this_hot_cycle)
-                    time.sleep(2)
-                else:
-                    if initial_peak_temp_this_hot_cycle is not None:
-                        # Display final 100% progress
-                        self._display_temperature_progress(float(waitTemperature), float(waitTemperature), initial_peak_temp_this_hot_cycle)
-                        sys.stdout.write("\n***** GPU cool down complete. Temperature is at or below target.\n")
-                        sys.stdout.flush()
-
-                    initial_peak_temp_this_hot_cycle = None
-                    cooling_message_printed_this_cycle = False
+                mine = [g for g in gpus if index is None or int(g.id) == int(index)]
+                if not mine:
+                    print("[holdup] GPU %s not found; failing closed" % index, file=sys.stderr)
+                    if fail_closed:
+                        raise RuntimeError("HoldUp: GPU %s is not visible to this process" % index)
                     break
+
+                current = float(mine[0].temperature)
+                if current <= target:
+                    if reported:
+                        print("\n[holdup] GPU %s at %.0fC <= %.0fC, continuing" % (mine[0].id, current, target))
+                    break
+
+                elapsed = time.time() - started
+                if elapsed >= max_wait:
+                    message = "HoldUp: GPU %s stayed at %.0fC above %.0fC for %.0fs" % (
+                        mine[0].id, current, target, max_wait)
+                    if fail_closed:
+                        raise RuntimeError(message)
+                    print("[holdup] %s; passing anyway (fail_closed=false)" % message, file=sys.stderr)
+                    break
+
+                if not reported:
+                    print("[holdup] GPU %s at %.0fC > %.0fC; waiting up to %.0fs" % (
+                        mine[0].id, current, target, max_wait))
+                    reported = True
+                time.sleep(interval)
 
         if waitSeconds > 0:
-            for i in range(waitSeconds, 0, -1):
-                full_line = f"\r***** Waiting: {i} / {waitSeconds} seconds    "
-                sys.stdout.write(full_line)
+            for i in range(int(waitSeconds), 0, -1):
+                sys.stdout.write("\r***** Waiting: %d / %d seconds    " % (i, waitSeconds))
                 sys.stdout.flush()
                 time.sleep(1)
+            print("\r***** Waited: %d seconds         " % waitSeconds)
 
-            print(f"\r***** Waited: {waitSeconds} seconds         ")
-
-        # Print timestamp and return input unchanged
         now = time.time()
-        time_tuple = time.localtime(now)
-        formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time_tuple)
-        print(f"\r***** {formatted_time}")
+        print("\r***** " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)))
         return (input,)
