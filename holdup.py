@@ -132,7 +132,10 @@ class HoldUp:
             policy, path = self._policy(policy_path)
             # The policy wins over the widget: the threshold is environmental and
             # has to change in one place, not inside every saved workflow.
-            target = float(policy["temp_limit_c"])
+            # The policy is the ceiling; a graph may ask for a stricter one but
+            # never a looser one. Ignoring the widget outright would make an
+            # explicit 45 in a workflow silently mean 50.
+            target = min(float(policy["temp_limit_c"]), float(waitTemperature))
             max_wait = float(policy["max_wait_s"])
             interval = float(policy["sample_interval_s"])
             fail_closed = bool(policy["fail_closed"])
