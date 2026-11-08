@@ -74,6 +74,34 @@ class HoldUp:
         sys.stdout.write(full_line)
         sys.stdout.flush()
 
+    def _temperatures(self):
+        """(index, celsius) for every GPU, without requiring a Python package.
+
+        nvidia-smi ships with the driver, so a project venv that cannot install
+        gputil still gets a working gate. GPUtil is only a fallback.
+        """
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,temperature.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10)
+            rows = []
+            for line in out.stdout.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 2 and parts[0].isdigit():
+                    rows.append((int(parts[0]), float(parts[1])))
+            if rows:
+                return rows
+        except Exception:
+            pass
+        try:
+            import GPUtil
+
+            return [(int(g.id), float(g.temperature)) for g in GPUtil.getGPUs()]
+        except Exception:
+            return []
+
     def _policy(self, policy_path):
         """Read the shared GPU policy, falling back to conservative defaults.
 
@@ -144,31 +172,28 @@ class HoldUp:
             started = time.time()
             reported = False
             while True:
-                try:
-                    gpus = GPUtil.getGPUs()
-                except Exception as exc:
-                    print("[holdup] cannot read GPU state (%s); skipping gate" % exc, file=sys.stderr)
-                    break
-                if not gpus:
+                temps = self._temperatures()
+                if not temps:
+                    print("[holdup] cannot read GPU temperature; skipping gate", file=sys.stderr)
                     break
 
-                mine = [g for g in gpus if index is None or int(g.id) == int(index)]
+                mine = [(i, c) for i, c in temps if index is None or i == int(index)]
                 if not mine:
                     print("[holdup] GPU %s not found; failing closed" % index, file=sys.stderr)
                     if fail_closed:
                         raise RuntimeError("HoldUp: GPU %s is not visible to this process" % index)
                     break
 
-                current = float(mine[0].temperature)
+                gpu_id, current = mine[0]
                 if current <= target:
                     if reported:
-                        print("\n[holdup] GPU %s at %.0fC <= %.0fC, continuing" % (mine[0].id, current, target))
+                        print("\n[holdup] GPU %s at %.0fC <= %.0fC, continuing" % (gpu_id, current, target))
                     break
 
                 elapsed = time.time() - started
                 if elapsed >= max_wait:
                     message = "HoldUp: GPU %s stayed at %.0fC above %.0fC for %.0fs" % (
-                        mine[0].id, current, target, max_wait)
+                        gpu_id, current, target, max_wait)
                     if fail_closed:
                         raise RuntimeError(message)
                     print("[holdup] %s; passing anyway (fail_closed=false)" % message, file=sys.stderr)
@@ -176,7 +201,7 @@ class HoldUp:
 
                 if not reported:
                     print("[holdup] GPU %s at %.0fC > %.0fC; waiting up to %.0fs" % (
-                        mine[0].id, current, target, max_wait))
+                        gpu_id, current, target, max_wait))
                     reported = True
                 time.sleep(interval)
 
