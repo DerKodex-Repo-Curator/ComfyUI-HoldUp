@@ -22,6 +22,11 @@ class HoldUp:
                 "use_waitTemperature": ("BOOLEAN", {"default": True}),
                 "waitTemperature": ("INT", {"default": 50, "min": 45, "max": 90}),
                 "waitSeconds": ("INT", {"default": 0, "min": 0, "max": 120}),
+                "gpus": ("STRING", {"default": "auto"}),
+                "use_waitUtilization": ("BOOLEAN", {"default": True}),
+                "utilization_max": ("INT", {"default": 20, "min": 1, "max": 100}),
+                "dwell_s": ("INT", {"default": 5, "min": 0, "max": 120}),
+                "temp_ceiling": ("INT", {"default": 85, "min": 45, "max": 100}),
             },
             "optional": {
                 "policy_path": ("STRING", {"default": ""}),
@@ -127,6 +132,71 @@ class HoldUp:
             print("[holdup] policy unavailable (%s); using defaults" % exc, file=sys.stderr)
             return defaults, path
 
+    def _gpu_indices(self, spec):
+        """Which physical GPUs this gate must see free.
+
+        "auto" is the project's own set: --cuda-device wins, otherwise every entry
+        of CUDA_VISIBLE_DEVICES — which already holds both cards when a project is
+        configured for multi-GPU, so Raylight needs no change here. "all" widens the
+        gate to the whole host, which is a policy choice, not a requirement: a busy
+        card you are not going to use does not hurt you.
+        """
+        import os
+
+        spec = (spec or "auto").strip()
+        if spec.lower() == "all":
+            return sorted(i for i, _c in self._temperatures())
+        if spec.lower() != "auto":
+            chosen = set()
+            for part in spec.replace(" ", "").split(","):
+                if part.isdigit():
+                    chosen.add(int(part))
+            if chosen:
+                return sorted(chosen)
+
+        try:
+            with open("/proc/self/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\x00")
+            argv = [a.decode("utf-8", "replace") for a in argv if a]
+            for i, arg in enumerate(argv):
+                if arg == "--cuda-device" and i + 1 < len(argv):
+                    return [int(argv[i + 1])]
+                if arg.startswith("--cuda-device="):
+                    return [int(arg.split("=", 1)[1])]
+        except (OSError, ValueError):
+            pass
+        env = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if env:
+            found = sorted({int(p) for p in env.split(",") if p.strip().isdigit()})
+            if found:
+                return found
+        try:
+            import torch
+
+            return [int(torch.cuda.current_device())]
+        except Exception:
+            return None
+
+    def _utilizations(self):
+        """(index, percent) per GPU, or None when the driver reports N/A."""
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10, check=True).stdout
+            rows = []
+            for line in out.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) != 2 or not parts[0].isdigit():
+                    continue
+                rows.append((int(parts[0]), float(parts[1]) if parts[1].replace(
+                    ".", "", 1).isdigit() else None))
+            return rows
+        except Exception:
+            return []
+
     def _my_gpu_index(self):
         """The physical GPU this process will use.
 
@@ -159,8 +229,81 @@ class HoldUp:
         except Exception:
             return None
 
-    def execute_cool_down(self, input, use_waitTemperature, waitTemperature, waitSeconds, policy_path=""):
-        if use_waitTemperature:
+    def execute_cool_down(self, input, use_waitTemperature, waitTemperature, waitSeconds,
+                          gpus="auto", use_waitUtilization=True, utilization_max=20,
+                          dwell_s=5, temp_ceiling=85, policy_path=""):
+        policy, _path = self._policy(policy_path)
+        max_wait = float(policy["max_wait_s"])
+        interval = float(policy["sample_interval_s"])
+        fail_closed = bool(policy["fail_closed"])
+
+        if use_waitUtilization:
+            # Utilization is the immediate signal; temperature lags by minutes. The
+            # ceiling only stops a run from starting on a card that is already hot.
+            util_max = min(float(policy.get("utilization_max", utilization_max)),
+                           float(utilization_max))
+            ceiling = min(float(policy.get("temp_ceiling_c", temp_ceiling)),
+                          float(temp_ceiling))
+            dwell = max(0.0, float(policy.get("dwell_s", dwell_s)))
+            indices = self._gpu_indices(gpus)
+
+            started = time.time()
+            free_since = None
+            reported = False
+            while True:
+                utils = self._utilizations()
+                temps = dict(self._temperatures())
+                if not utils:
+                    print("[holdup] cannot read GPU utilization; skipping gate",
+                          file=sys.stderr)
+                    break
+                mine = [(i, u) for i, u in utils if indices is None or i in indices]
+                if not mine:
+                    print("[holdup] GPUs %s not visible; failing closed" % indices,
+                          file=sys.stderr)
+                    if fail_closed:
+                        raise RuntimeError("HoldUp: GPUs %s are not visible to this process"
+                                           % indices)
+                    break
+
+                busy = []
+                for gpu_id, util in mine:
+                    if util is not None and util > util_max:
+                        busy.append("GPU%d %.0f%%>%.0f%%" % (gpu_id, util, util_max))
+                    temp = temps.get(gpu_id)
+                    if temp is not None and temp > ceiling:
+                        busy.append("GPU%d %.0fC>%.0fC" % (gpu_id, temp, ceiling))
+
+                now = time.time()
+                if not busy:
+                    if free_since is None:
+                        free_since = now
+                    if now - free_since >= dwell:
+                        if reported:
+                            print("\n[holdup] GPUs %s free for %.0fs, continuing"
+                                  % (list(indices) if indices else "all", dwell))
+                        break
+                else:
+                    free_since = None
+
+                if now - started >= max_wait:
+                    message = "HoldUp: GPUs %s not free for %.0fs (%s)" % (
+                        list(indices) if indices else "all", max_wait,
+                        ", ".join(busy) or "no stable window")
+                    if fail_closed:
+                        raise RuntimeError(message)
+                    print("[holdup] %s; passing anyway (fail_closed=false)" % message,
+                          file=sys.stderr)
+                    break
+
+                if not reported:
+                    print("[holdup] GPUs %s busy (%s); waiting up to %.0fs for %.0fs free"
+                          % (list(indices) if indices else "all",
+                             ", ".join(busy) or "gathering", max_wait, dwell))
+                    reported = True
+                time.sleep(interval)
+
+        elif use_waitTemperature:
             policy, path = self._policy(policy_path)
             # The policy wins over the widget: the threshold is environmental and
             # has to change in one place, not inside every saved workflow.
