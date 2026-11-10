@@ -177,6 +177,20 @@ class HoldUp:
         except Exception:
             return None
 
+    def _check_interrupt(self):
+        """Let ComfyUI's Cancel reach a waiting gate.
+
+        A node that only sleeps ignores the interrupt flag, so a long or unlimited
+        wait cannot be cancelled from the UI and blocks the project's queue until
+        the process is stopped. Checking between samples makes the wait abortable.
+        """
+        try:
+            import comfy.model_management as model_management
+
+            model_management.throw_exception_if_processing_interrupted()
+        except ImportError:  # running outside ComfyUI
+            pass
+
     def _utilizations(self):
         """(index, percent) per GPU, or None when the driver reports N/A."""
         import subprocess
@@ -251,6 +265,7 @@ class HoldUp:
             free_since = None
             reported = False
             while True:
+                self._check_interrupt()
                 utils = self._utilizations()
                 temps = dict(self._temperatures())
                 if not utils:
@@ -319,6 +334,7 @@ class HoldUp:
             started = time.time()
             reported = False
             while True:
+                self._check_interrupt()
                 temps = self._temperatures()
                 if not temps:
                     print("[holdup] cannot read GPU temperature; skipping gate", file=sys.stderr)
